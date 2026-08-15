@@ -1,0 +1,42 @@
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+# React Router / client-side routing fallback — without this, refreshing on
+# any non-root path (or Firebase Auth redirect flows) would 404 on Netlify.
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+
+# NOTE: There is no /api/* proxy redirect here on purpose. The backend
+# (Firebase Cloud Functions) lives on a completely different domain than
+# this Netlify site, so the frontend calls it by its full absolute URL —
+# see VITE_API_BASE_URL in .env / Netlify environment variables, and
+# src/lib/claudeApi.ts + src/lib/mailboxApi.ts. CORS is restricted on the
+# Functions side (functions/index.js, ALLOWED_ORIGIN) to allow only this
+# site's origin to call it.
+
+# ---------------------------------------------------------------------------
+# Security headers — applied by Netlify's CDN to every response.
+# ---------------------------------------------------------------------------
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "DENY"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+    Permissions-Policy = "camera=(), microphone=(), geolocation=(), payment=()"
+    Strict-Transport-Security = "max-age=31536000; includeSubDomains"
+    # connect-src includes:
+    #   *.googleapis.com / *.firebaseio.com / firestore.googleapis.com — Firestore + Auth
+    #   *.run.app / *.cloudfunctions.net — your Firebase Functions backend (adjust to your actual VITE_API_BASE_URL host if different)
+    # img-src 'self' data: — signature images are captured as data: URLs (SignaturePad.tsx)
+    Content-Security-Policy = "default-src 'self'; script-src 'self' 'unsafe-inline' https://apis.google.com https://www.google.com/recaptcha/ https://www.gstatic.com/recaptcha/;https://www.gstatic.com/recaptcha/; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' https://*.googleapis.com https://*.firebaseio.com https://firestore.googleapis.com https://*.run.app https://*.cloudfunctions.net https://www.google.com/recaptcha/ https://www.gstatic.com/recaptcha/; frame-src https://*.firebaseapp.com https://*.google.com https://*.google.com/recaptcha/; object-src 'none'; base-uri 'self'; form-action 'self';"
+
+# Long-lived caching for hashed build assets (Vite fingerprints filenames,
+# so this is safe — a new deploy always produces new filenames).
+[[headers]]
+  for = "/assets/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"

@@ -1,0 +1,52 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    function signedIn() { return request.auth != null; }
+    function role() {
+      return signedIn() && request.auth.token.role != null
+        ? request.auth.token.role : "USER";
+    }
+    function admin() { return role() == "ADMIN"; }
+    function deptAdmin() { return role() in ["DEPARTMENT_ADMIN", "ADMIN"]; }
+
+    match /signatures/{uid}/{fileName} {
+      allow read: if signedIn() && (request.auth.uid == uid || admin());
+      allow write: if signedIn() && (request.auth.uid == uid || admin())
+        && request.resource.size < 2 * 1024 * 1024
+        && request.resource.contentType.matches('image/(png|jpeg|webp)');
+      allow delete: if signedIn() && (request.auth.uid == uid || admin());
+    }
+
+    match /files/{uid}/{fileName} {
+      allow read: if signedIn() && (request.auth.uid == uid || deptAdmin());
+      // Write/delete restricted to the file's own owner or a true ADMIN —
+      // NOT any DEPARTMENT_ADMIN. This used to also allow deptAdmin(),
+      // which let a Department Admin delete another officer's file
+      // directly via the Storage SDK, bypassing the app's
+      // DELETE /api/attachments/:id route entirely — that route is what
+      // keeps the Firestore `attachments` pointer and the actual Storage
+      // object in sync and writes a proper audit-log entry. A direct
+      // Storage-level delete skipped both, leaving an orphaned Firestore
+      // record (a "download" that silently 404s) with no audit trail.
+      // Department Admins can still delete same-department attachments —
+      // just through that backend route now, which does the same
+      // authorization check plus keeps everything consistent.
+      allow write: if signedIn() && request.auth.uid == uid
+        && request.resource.size < 25 * 1024 * 1024
+        && request.resource.contentType.matches('(application/pdf|application/msword|application/vnd.openxmlformats-officedocument.wordprocessingml.document|application/vnd.ms-excel|application/vnd.openxmlformats-officedocument.spreadsheetml.sheet|image/.*|text/plain)');
+      allow delete: if signedIn() && (request.auth.uid == uid || admin());
+    }
+
+    match /ai-staging/{uid}/{fileName} {
+      allow read: if signedIn() && request.auth.uid == uid;
+      allow write: if signedIn() && request.auth.uid == uid
+        && request.resource.size < 25 * 1024 * 1024;
+      allow delete: if signedIn() && request.auth.uid == uid;
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

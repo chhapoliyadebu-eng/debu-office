@@ -1,0 +1,8 @@
+{
+  "name": "Haryana Roadways Drafting Portal",
+  "short_name": "Haryana Roadways",
+  "start_url": "/",
+  "display": "standalone",
+  "description": "Official drafting and file workflow portal.",
+  "icons": [{"src":"/favicon.svg","sizes":"any","type":"image/svg+xml","purpose":"any maskable"}]
+}

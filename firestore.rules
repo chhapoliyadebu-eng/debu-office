@@ -1,0 +1,408 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function role() {
+      return isSignedIn() && request.auth.token.role != null
+        ? request.auth.token.role
+        : "USER";
+    }
+
+    function isAdmin() {
+      return role() == "ADMIN";
+    }
+
+    function isDepartmentAdmin() {
+      return role() in ["DEPARTMENT_ADMIN", "ADMIN"];
+    }
+
+    function userDoc(uid) {
+      return get(/databases/$(database)/documents/users/$(uid));
+    }
+
+    function myProfileExists() {
+      return isSignedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function mySeat() {
+      return userDoc(request.auth.uid).data.seat;
+    }
+
+    function myDepartment() {
+      return userDoc(request.auth.uid).data.department;
+    }
+
+    function myWing() {
+      return userDoc(request.auth.uid).data.wing;
+    }
+
+    function owns(data) {
+      return isSignedIn() && data.ownerUid == request.auth.uid;
+    }
+
+    function sameOrg(data) {
+      return isSignedIn()
+        && data.department == myDepartment()
+        && (data.wing == null || data.wing == myWing());
+    }
+
+    function canAccess(data) {
+      return isAdmin() || owns(data) || (isDepartmentAdmin() && sameOrg(data))
+        || (isSignedIn() && data.get('sharedWith', {}).get(request.auth.uid, null) != null);
+    }
+
+    function validText(field, min, max) {
+      return field is string && field.size() >= min && field.size() <= max;
+    }
+
+    // ------------------------------------------------------------------
+    // Rules / circulars: public reading is removed. These are departmental
+    // records and are available only after authentication. Any signed-in
+    // officer may suggest/upload a rule for review; verifying, rejecting,
+    // or publishing one is ADMIN-only AND now goes only through the
+    // backend (POST /api/rules/:id/verify etc.) so it gets a real
+    // actor-attributed audit-log entry — a raw client write has no server
+    // to log from. The client can therefore only ever CREATE a rule as
+    // PENDING_VERIFICATION; it can no longer flip status at all.
+    // ------------------------------------------------------------------
+    match /rules/{ruleId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn()
+        && validText(request.resource.data.title, 1, 300)
+        && validText(request.resource.data.category, 1, 200)
+        && request.resource.data.status == "PENDING_VERIFICATION"
+        && request.resource.data.fullText is string
+        && request.resource.data.fullText.size() <= 20000;
+      allow update: if false; // verify/reject only via backend — see comment above
+      allow delete: if isAdmin();
+    }
+
+    match /circulars/{circularId} {
+      allow read: if isSignedIn();
+      allow create: if isDepartmentAdmin()
+        && request.resource.data.status == "PENDING_REVIEW"
+        && validText(request.resource.data.title, 1, 300)
+        && request.resource.data.sourceUrl is string;
+      // Publish/dismiss only via backend (POST /api/circulars/:id/publish
+      // and /dismiss) — same audit-trail reasoning as `rules` above, plus
+      // publishing needs to atomically CREATE a new VERIFIED `rules` doc,
+      // which the client can never do (see the `rules` create rule).
+      allow update: if false;
+      allow delete: if isAdmin();
+    }
+
+    // Markings are collaborative workflow records. A user can create a
+    // marking from their own seat and action a marking addressed to their
+    // seat; admins can manage all markings.
+    match /markings/{markingId} {
+      allow read: if isAdmin()
+        || (isSignedIn() && (resource.data.markedBy == mySeat() || resource.data.markedTo == mySeat()));
+      allow create: if isSignedIn()
+        && request.resource.data.markedBy == mySeat()
+        && validText(request.resource.data.instructions, 1, 2000)
+        && request.resource.data.status == "PENDING";
+      allow update: if isAdmin()
+        || (isSignedIn()
+          && resource.data.markedTo == mySeat()
+          && request.resource.data.status in ["ACTIONED", "RETURNED"]);
+      allow delete: if isAdmin();
+    }
+
+    // Documents are owned by the creating seat. The owner can edit their
+    // own document; admins can manage all documents.
+    match /documents/{docId} {
+      allow read: if canAccess(resource.data);
+      allow create: if isSignedIn()
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.createdBy == mySeat()
+        && request.resource.data.department == myDepartment()
+        && request.resource.data.wing == myWing()
+        && request.resource.data.type in ["NOTING", "LETTER", "ENDORSEMENT"]
+        && validText(request.resource.data.title, 1, 300)
+        && request.resource.data.paras is list
+        && request.resource.data.paras.size() <= 100;
+      allow update: if isAdmin()
+        || (isSignedIn()
+          && resource.data.ownerUid == request.auth.uid
+          && resource.data.createdBy == mySeat()
+          && request.resource.data.ownerUid == resource.data.ownerUid
+          && request.resource.data.createdBy == resource.data.createdBy
+          && request.resource.data.department == resource.data.department
+          && request.resource.data.wing == resource.data.wing
+          && request.resource.data.get('sharedWith', {}) == resource.data.get('sharedWith', {})
+          && request.resource.data.type in ["NOTING", "LETTER", "ENDORSEMENT"]
+          && validText(request.resource.data.title, 1, 300)
+          && request.resource.data.paras is list
+          && request.resource.data.paras.size() <= 100)
+        // A colleague this document was shared with at EDIT permission may
+        // save content changes — but never touch ownership/department/wing
+        // or the share list itself (only the owner, via the backend
+        // POST /api/documents/:id/share, can change who has access).
+        || (isSignedIn()
+          && resource.data.get('sharedWith', {}).get(request.auth.uid, {}).get('permission', '') == "EDIT"
+          && request.resource.data.ownerUid == resource.data.ownerUid
+          && request.resource.data.createdBy == resource.data.createdBy
+          && request.resource.data.department == resource.data.department
+          && request.resource.data.wing == resource.data.wing
+          && request.resource.data.get('sharedWith', {}) == resource.data.get('sharedWith', {})
+          && request.resource.data.type in ["NOTING", "LETTER", "ENDORSEMENT"]
+          && validText(request.resource.data.title, 1, 300)
+          && request.resource.data.paras is list
+          && request.resource.data.paras.size() <= 100);
+      allow delete: if isAdmin() || (owns(resource.data) && resource.data.createdBy == mySeat());
+    }
+
+
+
+    // Persistent File Register. Records are scoped by owner/department; file
+    // movement history is immutable and can only be appended by the backend.
+    match /files/{fileId} {
+      allow read: if canAccess(resource.data);
+      allow create: if isSignedIn()
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.department == myDepartment()
+        && request.resource.data.wing == myWing()
+        && validText(request.resource.data.fileNo, 1, 100)
+        && validText(request.resource.data.subject, 1, 1000);
+      allow update: if isAdmin()
+        || (owns(resource.data)
+          && request.resource.data.ownerUid == resource.data.ownerUid
+          && request.resource.data.department == resource.data.department
+          && request.resource.data.wing == resource.data.wing);
+      allow delete: if isAdmin();
+    }
+
+    match /fileMovements/{movementId} {
+      allow read: if isAdmin()
+        || (isDepartmentAdmin()
+          && resource.data.fileId != null
+          && get(/databases/$(database)/documents/files/$(resource.data.fileId)).data.department == myDepartment());
+      allow create, update, delete: if false;
+    }
+
+    // Templates: SYSTEM templates are admin-managed. PERSONAL templates are
+    // scoped to the user's seat.
+    // Attachments: file/scan/PDF metadata linked to a document or incoming
+    // letter. The actual bytes live in Storage under files/{uploaderUid}/...
+    // (storage.rules); this Firestore doc is just the pointer + who-can-see-it
+    // record. Reading is allowed to: the uploader, Admin, a Department Admin
+    // in the SAME department as the attachment, OR anyone who already has
+    // canAccess() on the document it's linked to (so a colleague this
+    // document was shared with — Section 43C sharing — also sees its
+    // attachments, not just the uploader). Deleting always goes through the
+    // backend (DELETE /api/attachments/:id) so the actual Storage object is
+    // cleaned up too, not just the Firestore pointer — a client-only delete
+    // would leave an orphaned file in Storage forever.
+    match /attachments/{attachmentId} {
+      allow read: if isAdmin()
+        || resource.data.uploadedBy == request.auth.uid
+        || (isDepartmentAdmin() && resource.data.department == myDepartment())
+        || (resource.data.linkedType == "document"
+            && canAccess(get(/databases/$(database)/documents/documents/$(resource.data.linkedId)).data));
+      allow create: if isSignedIn()
+        && request.resource.data.uploadedBy == request.auth.uid
+        && request.resource.data.department == myDepartment()
+        && request.resource.data.wing == myWing()
+        && request.resource.data.storagePath == "files/" + request.auth.uid + "/" + request.resource.data.storageFileName
+        && validText(request.resource.data.fileName, 1, 200)
+        && validText(request.resource.data.storageFileName, 1, 200)
+        && request.resource.data.linkedType in ["document", "incomingLetter"]
+        && validText(request.resource.data.linkedId, 1, 200)
+        && request.resource.data.size is number
+        && request.resource.data.size <= 26214400;
+      allow update: if false;
+      allow delete: if false; // only via backend — keeps the Storage object and this pointer in sync
+    }
+
+    match /templates/{templateId} {
+      allow read: if isAdmin() || resource.data.scope == "SYSTEM" || resource.data.ownerUid == request.auth.uid;
+      allow create: if isAdmin()
+        || (isSignedIn()
+          && request.resource.data.scope == "PERSONAL"
+          && request.resource.data.owner == mySeat()
+          && request.resource.data.ownerUid == request.auth.uid
+          && request.resource.data.department == myDepartment());
+      allow update: if isAdmin()
+        || (isSignedIn()
+          && resource.data.scope == "PERSONAL"
+          && resource.data.owner == mySeat()
+          && resource.data.ownerUid == request.auth.uid
+          && request.resource.data.ownerUid == request.auth.uid
+          && request.resource.data.scope == "PERSONAL"
+          && request.resource.data.owner == mySeat());
+      allow delete: if isAdmin()
+        || (isSignedIn() && resource.data.scope == "PERSONAL" && resource.data.owner == mySeat() && resource.data.ownerUid == request.auth.uid);
+    }
+
+    match /styleSamples/{sampleId} {
+      allow read: if isAdmin() || resource.data.ownerUid == request.auth.uid;
+      allow create: if isSignedIn()
+        && request.resource.data.ownerSeat == mySeat()
+        && request.resource.data.ownerUid == request.auth.uid
+        && validText(request.resource.data.sampleText, 1, 4000);
+      allow update: if isAdmin()
+        || (isSignedIn()
+          && resource.data.ownerSeat == mySeat()
+          && resource.data.ownerUid == request.auth.uid
+          && request.resource.data.ownerSeat == mySeat()
+          && request.resource.data.ownerUid == request.auth.uid
+          && validText(request.resource.data.sampleText, 1, 4000));
+      allow delete: if isAdmin() || (isSignedIn()
+        && resource.data.ownerSeat == mySeat()
+        && resource.data.ownerUid == request.auth.uid);
+    }
+
+    // Incoming letters and mail can be created by authenticated staff for
+    // import/workflow. Updates to another user's records are blocked unless
+    // an administrator performs them.
+    match /incomingLetters/{letterId} {
+      allow read: if canAccess(resource.data);
+      allow create: if isSignedIn()
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.department == myDepartment()
+        && request.resource.data.wing == myWing()
+        && validText(request.resource.data.subject, 1, 500);
+      // Note: `locked` immutability applies to EVERYONE once true, ADMIN
+      // included — an admin who needs to correct a bad import uses delete
+      // (below) rather than a silent edit, so the original content a user
+      // relied on is never quietly rewritten out from under them.
+      allow update: if (isAdmin() || owns(resource.data))
+        && resource.data.locked == false
+        && request.resource.data.ownerUid == resource.data.ownerUid
+        && request.resource.data.department == resource.data.department
+        && request.resource.data.locked == false;
+      allow delete: if isAdmin();
+    }
+
+    match /mail/{mailId} {
+      allow read: if canAccess(resource.data);
+      allow create: if isSignedIn()
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.department == myDepartment()
+        && request.resource.data.wing == myWing()
+        && validText(request.resource.data.subject, 1, 500);
+      allow update: if isAdmin()
+        || (owns(resource.data) && request.resource.data.ownerUid == resource.data.ownerUid
+            && request.resource.data.department == resource.data.department);
+      allow delete: if isAdmin() || owns(resource.data);
+    }
+
+    // Office mailbox metadata is read-only from the browser. The backend
+    // creates/updates it with the Admin SDK after authenticating the caller.
+    match /mailAccounts/{accountId} {
+      allow read: if isSignedIn();
+      allow write: if false;
+    }
+
+    // Credentials are backend-only. Client SDK access is always denied.
+    match /mailAccountSecrets/{accountId} {
+      allow read, write: if false;
+    }
+
+    // ------------------------------------------------------------------
+    // User profiles: self-registration can ONLY create a USER profile.
+    // Changing role/seat/designation of another user requires ADMIN. The
+    // backend trigger copies the approved role to Auth custom claims.
+    // ------------------------------------------------------------------
+    match /users/{uid} {
+      allow read: if isAdmin() || request.auth.uid == uid
+        || (isDepartmentAdmin() && (userDoc(uid).data.department == myDepartment() || userDoc(uid).data.department == "Unassigned"));
+
+      allow create: if isSignedIn()
+        && request.auth.uid == uid
+        && request.resource.data.role == "USER"
+        && request.resource.data.id == uid
+        && request.resource.data.email == request.auth.token.email
+        && validText(request.resource.data.name, 1, 200);
+
+      allow update: if isAdmin()
+        && request.resource.data.id == uid
+        && request.resource.data.role in ["USER", "DEPARTMENT_ADMIN", "ADMIN"]
+        && validText(request.resource.data.name, 1, 200);
+
+      // A DEPARTMENT_ADMIN may onboard/manage USER-role accounts in their
+      // own department (or claim a brand-new "Unassigned" sign-up into it)
+      // — but can never touch role, never touch an ADMIN/DEPARTMENT_ADMIN
+      // account, and never move someone into a different department.
+      // In normal use these edits go through the backend's PATCH
+      // /api/users/:uid (so they get a proper audit-log entry with who did
+      // it) — this rule exists as defense-in-depth in case of a direct
+      // Firestore write, not as the primary path.
+      allow update: if isDepartmentAdmin()
+        && role() == "DEPARTMENT_ADMIN"
+        && request.resource.data.id == uid
+        && resource.data.role == "USER"
+        && request.resource.data.role == "USER"
+        && request.resource.data.email == resource.data.email
+        && (resource.data.department == myDepartment() || resource.data.department == "Unassigned")
+        && request.resource.data.department == myDepartment()
+        && validText(request.resource.data.name, 1, 200)
+        && validText(request.resource.data.designation, 1, 200)
+        && validText(request.resource.data.wing, 1, 200)
+        && validText(request.resource.data.seat, 1, 200);
+
+      allow update: if isSignedIn()
+        && request.auth.uid == uid
+        && request.resource.data.id == uid
+        && request.resource.data.role == resource.data.role
+        && request.resource.data.email == resource.data.email
+        && request.resource.data.seat == resource.data.seat
+        && request.resource.data.wing == resource.data.wing
+        && request.resource.data.designation == resource.data.designation
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["name", "nameHi", "activeStyleSampleId"])
+        && validText(request.resource.data.name, 1, 200);
+
+      allow delete: if isAdmin();
+    }
+
+    // Payments are administrative verification records. Users can read their
+    // own queue only after the app migrates to an ownerUid field; until then,
+    // writes are ADMIN-only to prevent client-side status forgery.
+    match /paymentVerifications/{payId} {
+      allow read: if isDepartmentAdmin();
+      allow create: if isAdmin()
+        && request.resource.data.status == "PENDING";
+      // Verify/reject only via backend (POST /api/payments/:id/verify or
+      // /reject) for a proper audit-log entry — same reasoning as `rules`
+      // above. This is UTR payment verification; it should never be a
+      // silent, unlogged client write.
+      allow update: if false;
+      allow delete: if isAdmin();
+    }
+
+    // Audit logs are server-generated only. This prevents users from writing
+    // forged audit entries directly through the Firestore SDK.
+    match /auditLog/{entryId} {
+      allow read: if isDepartmentAdmin();
+      allow write: if false;
+    }
+
+    // AI logs/responses/quotas and distributed API rate-limit counters are
+    // backend-only. Admin SDK bypasses these client rules.
+    match /aiRoutingLogs/{logId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+    match /aiResponses/{responseId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+    match /aiUsageCounters/{counterId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+    match /apiRateLimitsAI/{counterId} {
+      allow read, write: if false;
+    }
+    match /apiRateLimitsMailbox/{counterId} {
+      allow read, write: if false;
+    }
+    match /apiRateLimitsFiles/{counterId} {
+      allow read, write: if false;
+    }
+  }
+}
